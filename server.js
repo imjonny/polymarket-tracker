@@ -61,11 +61,16 @@ async function getMarketInfo(tokenId) {
     if (Array.isArray(response.data)) {
       for (const market of response.data) {
         const tokens = market.clobTokenIds || [];
-        if (tokens.includes(tokenId)) {
+        // Find which position this token represents
+        const tokenIndex = tokens.indexOf(tokenId);
+        if (tokenIndex !== -1) {
+          // Token 0 is YES, Token 1 is NO (based on Polymarket convention)
+          const outcome = tokenIndex === 0 ? 'YES' : 'NO';
           const info = {
             question: market.question || market.title,
             slug: market.slug,
-            active: market.active !== false && market.closed !== true
+            active: market.active !== false && market.closed !== true,
+            outcome: outcome
           };
           marketCache.set(tokenId, info);
           return info;
@@ -77,7 +82,7 @@ async function getMarketInfo(tokenId) {
   }
   
   // If not found in active markets, it's probably closed/resolved
-  return { question: 'Unknown Market', slug: '', active: false };
+  return { question: 'Unknown Market', slug: '', active: false, outcome: 'UNKNOWN' };
 }
 
 // Check wallet age on Polygon
@@ -193,10 +198,24 @@ async function processTradeEvent(event) {
     // Trade size is the larger of the two amounts
     const tradeSize = Math.max(parseFloat(makerAmount), parseFloat(takerAmount));
     
-    // Determine which side they're buying (YES or NO)
-    // In Polymarket, lower token ID is typically YES, higher is NO
-    const isBuyingYes = makerAssetId < takerAssetId;
-    const outcome = isBuyingYes ? 'YES' : 'NO';
+    // Determine YES/NO based on which token is being bought
+    // If makerAssetId is 0, maker is BUYING (paying USDC, getting tokens)
+    // If takerAssetId is 0, taker is BUYING (paying USDC, getting tokens)
+    let outcome = 'UNKNOWN';
+    let tokenId = '';
+    
+    if (makerAssetId === '0') {
+      // Maker is buying, taker is selling
+      // Maker gets takerAssetId tokens
+      tokenId = takerAssetId;
+    } else if (takerAssetId === '0') {
+      // Taker is buying, maker is selling
+      // Taker gets makerAssetId tokens
+      tokenId = makerAssetId;
+    }
+    
+    // We'll determine YES vs NO from the market API when we fetch market info
+    // For now, store the tokenId
     
     // Filter by minimum trade size
     if (tradeSize < CONFIG.MIN_TRADE_SIZE) return;
@@ -229,8 +248,7 @@ async function processTradeEvent(event) {
     
     console.log(`   Trade happened ${secondsAgo} seconds ago`);
     
-    // Get market info
-    const tokenId = event.args.makerAssetId.toString();
+    // Get market info and determine YES/NO
     const marketInfo = await getMarketInfo(tokenId);
     
     // Skip if market is closed/resolved
@@ -238,6 +256,8 @@ async function processTradeEvent(event) {
       console.log(`   Skipped: Market is closed/resolved`);
       return;
     }
+    
+    const outcome = marketInfo.outcome || 'UNKNOWN';
     
     const trade = {
       id: txHash,
