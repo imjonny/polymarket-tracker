@@ -1,9 +1,10 @@
-// server.js - Polymarket Whale Tracker Backend
-// Run with: node server.js
+// server.js - Polymarket Whale Tracker with Blockchain Scraper
+// Monitors Polymarket trades directly from Polygon blockchain
 
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const { ethers } = require('ethers');
 
 const app = express();
 app.use(cors());
@@ -11,82 +12,65 @@ app.use(express.json());
 
 // Configuration
 const CONFIG = {
-  MIN_TRADE_SIZE: process.env.MIN_TRADE_SIZE || 10000,
-  MAX_ACCOUNT_AGE_DAYS: process.env.MAX_ACCOUNT_AGE_DAYS || 7,
+  MIN_TRADE_SIZE: parseInt(process.env.MIN_TRADE_SIZE) || 10000,
+  MAX_ACCOUNT_AGE_DAYS: parseInt(process.env.MAX_ACCOUNT_AGE_DAYS) || 7,
   DISCORD_WEBHOOK: process.env.DISCORD_WEBHOOK || '',
-  POLL_INTERVAL: 45000, // 45 seconds
+  POLL_INTERVAL: 15000, // 15 seconds
+  
+  // Polymarket Contracts on Polygon
+  CTF_EXCHANGE: '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E',
+  CONDITIONAL_TOKENS: '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045',
+  
+  // Polygon RPC
+  POLYGON_RPC: process.env.POLYGON_RPC || 'https://polygon-rpc.com',
+  
+  // APIs
   GAMMA_API: 'https://gamma-api.polymarket.com',
-  STRAPI_API: 'https://strapi-matic.poly.market'
+  POLYGONSCAN_KEY: process.env.POLYGONSCAN_API_KEY || 'YourApiKeyToken'
 };
 
 // In-memory storage
 const recentTrades = [];
-const seenTradeIds = new Set();
-const trackedMarkets = new Map();
+const seenTxHashes = new Set();
+const marketCache = new Map();
+let lastBlockChecked = 0;
 
-// Get active markets with event data
-async function getActiveMarkets() {
+// Initialize Polygon provider
+const provider = new ethers.JsonRpcProvider(CONFIG.POLYGON_RPC);
+
+// CTF Exchange ABI (OrderFilled event)
+const CTF_EXCHANGE_ABI = [
+  'event OrderFilled(bytes32 indexed orderHash, address indexed maker, address indexed taker, uint256 makerAssetId, uint256 takerAssetId, uint256 makerAmountFilled, uint256 takerAmountFilled, uint256 fee)'
+];
+
+const ctfExchange = new ethers.Contract(CONFIG.CTF_EXCHANGE, CTF_EXCHANGE_ABI, provider);
+
+// Get market info from Gamma API
+async function getMarketInfo(tokenId) {
+  if (marketCache.has(tokenId)) {
+    return marketCache.get(tokenId);
+  }
+  
   try {
-    const response = await axios.get(`${CONFIG.GAMMA_API}/markets`, {
-      params: {
-        limit: 20,
-        active: true,
-        closed: false,
-        order: 'volume24hr',
-        ascending: false
-      },
-      timeout: 10000
-    });
-    
+    const response = await axios.get(`${CONFIG.GAMMA_API}/markets`);
     if (Array.isArray(response.data)) {
-      return response.data.filter(m => m.volume24hr > 1000);
+      for (const market of response.data) {
+        const tokens = market.clobTokenIds || [];
+        if (tokens.includes(tokenId)) {
+          const info = {
+            question: market.question || market.title,
+            slug: market.slug
+          };
+          marketCache.set(tokenId, info);
+          return info;
+        }
+      }
     }
-    return [];
   } catch (error) {
-    console.error('Error fetching markets:', error.message);
-    return [];
+    console.error('Error fetching market info:', error.message);
   }
-}
-
-// Get recent events (trades) from Strapi API
-async function getRecentEvents(tokenId) {
-  try {
-    const response = await axios.get(`${CONFIG.STRAPI_API}/markets/${tokenId}`, {
-      timeout: 10000
-    });
-    
-    if (response.data && response.data.events) {
-      return response.data.events;
-    }
-    return [];
-  } catch (error) {
-    // Strapi API might not have all markets, that's ok
-    return [];
-  }
-}
-
-// Alternative: Get market activity from Gamma API events
-async function getMarketEvents(conditionId) {
-  try {
-    const response = await axios.get(`${CONFIG.GAMMA_API}/events`, {
-      params: {
-        market: conditionId,
-        limit: 50
-      },
-      timeout: 10000
-    });
-    
-    if (Array.isArray(response.data)) {
-      return response.data.filter(e => 
-        e.event_type === 'trade' || 
-        e.event_type === 'order_matched'
-      );
-    }
-    return [];
-  } catch (error) {
-    // Events endpoint might not be available
-    return [];
-  }
+  
+  return { question: 'Unknown Market', slug: '' };
 }
 
 // Check wallet age on Polygon
@@ -102,7 +86,7 @@ async function getWalletAge(address) {
         page: 1,
         offset: 1,
         sort: 'asc',
-        apikey: process.env.POLYGONSCAN_API_KEY || 'YourApiKeyToken'
+        apikey: CONFIG.POLYGONSCAN_KEY
       },
       timeout: 8000
     });
@@ -112,120 +96,171 @@ async function getWalletAge(address) {
       const ageInDays = (Date.now() / 1000 - firstTxTimestamp) / 86400;
       return Math.floor(ageInDays);
     }
+    
+    // No transactions found - brand new wallet!
     return 0;
   } catch (error) {
-    console.error(`Wallet age check failed:`, error.message);
-    // If we can't verify age, assume it's new (be conservative)
+    console.error('Wallet age check error:', error.message);
+    // If we can't check, assume it's new to be safe
     return 0;
   }
 }
 
-// Send Discord notification
+// Send Discord alert
 async function sendDiscordAlert(trade) {
   if (!CONFIG.DISCORD_WEBHOOK) {
-    console.log('⚠️  No Discord webhook configured');
+    console.log('⚠️  Discord webhook not configured');
     return;
   }
   
   try {
+    const accountAgeEmoji = trade.accountAge <= 1 ? '🆕' : trade.accountAge <= 7 ? '⚠️' : '✅';
+    
     const embed = {
-      title: '🐋 Large Trade Alert!',
-      color: trade.outcome === 'YES' ? 0x00ff00 : 0xff0000,
+      title: '🐋 WHALE ALERT - New Account Large Trade!',
+      color: 0xFF6B00, // Orange
       fields: [
-        { name: '📊 Market', value: trade.market, inline: false },
-        { name: '📈 Outcome', value: trade.outcome, inline: true },
-        { name: '💰 Amount', value: `$${trade.amount.toLocaleString()}`, inline: true },
-        { name: '💵 Price', value: `$${trade.price}`, inline: true },
-        { name: '👤 Wallet', value: `\`${trade.address.slice(0, 8)}...${trade.address.slice(-6)}\``, inline: true },
-        { name: '🕐 Account Age', value: `${trade.accountAge} days`, inline: true },
-        { name: '🔗 View', value: `[Polymarket](https://polymarket.com)`, inline: true }
+        { 
+          name: '📊 Market', 
+          value: trade.market || 'Loading...', 
+          inline: false 
+        },
+        { 
+          name: '💰 Trade Amount', 
+          value: `**$${trade.amount.toLocaleString()}**`, 
+          inline: true 
+        },
+        { 
+          name: `${accountAgeEmoji} Account Age`, 
+          value: `**${trade.accountAge} days**`, 
+          inline: true 
+        },
+        { 
+          name: '👤 Trader Wallet', 
+          value: `\`${trade.maker.slice(0, 8)}...${trade.maker.slice(-6)}\``, 
+          inline: false 
+        },
+        { 
+          name: '🔗 Transaction', 
+          value: `[View on Polygonscan](https://polygonscan.com/tx/${trade.txHash})`, 
+          inline: false 
+        }
       ],
       timestamp: new Date().toISOString(),
-      footer: { text: 'Polymarket Whale Tracker' }
+      footer: { text: 'Polymarket Whale Tracker | Live Blockchain Monitoring' }
     };
 
-    await axios.post(CONFIG.DISCORD_WEBHOOK, { embeds: [embed] });
-    console.log(`✅ Discord alert sent: $${trade.amount.toFixed(0)}`);
+    await axios.post(CONFIG.DISCORD_WEBHOOK, { 
+      content: `@everyone 🚨 **NEW WHALE DETECTED!** Account less than ${CONFIG.MAX_ACCOUNT_AGE_DAYS} days old made a **$${trade.amount.toLocaleString()}** trade!`,
+      embeds: [embed] 
+    });
+    
+    console.log(`✅ Discord alert sent! $${trade.amount.toFixed(0)} from ${trade.accountAge}d old account`);
   } catch (error) {
-    console.error('❌ Discord notification failed:', error.message);
+    console.error('❌ Discord alert failed:', error.message);
   }
 }
 
-// Simulate trade detection from market data changes
-async function detectLargeTrades(market) {
+// Process OrderFilled event
+async function processTradeEvent(event) {
   try {
-    const conditionId = market.condition_id || market.clobTokenIds?.[0];
-    if (!conditionId) return;
+    const txHash = event.transactionHash;
     
-    const currentVolume = parseFloat(market.volume24hr || 0);
-    const lastVolume = trackedMarkets.get(conditionId) || currentVolume;
-    const volumeIncrease = currentVolume - lastVolume;
+    if (seenTxHashes.has(txHash)) return;
+    seenTxHashes.add(txHash);
     
-    trackedMarkets.set(conditionId, currentVolume);
+    const maker = event.args.maker;
+    const taker = event.args.taker;
+    const makerAmount = ethers.formatUnits(event.args.makerAmountFilled, 6); // USDC has 6 decimals
+    const takerAmount = ethers.formatUnits(event.args.takerAmountFilled, 6);
     
-    // If volume increased significantly, check for large trades
-    if (volumeIncrease > CONFIG.MIN_TRADE_SIZE) {
-      console.log(`📊 Large volume spike detected: $${volumeIncrease.toFixed(0)} on ${market.question}`);
-      
-      // Create a simulated trade event for significant volume changes
-      // In production, you'd need Polymarket API key to get real trade data
-      const mockTrade = {
-        id: `${conditionId}-${Date.now()}`,
-        timestamp: new Date(),
-        market: market.question || market.title,
-        outcome: 'UNKNOWN', // Can't determine without trade data
-        amount: volumeIncrease,
-        price: '0.00',
-        address: '0x' + '0'.repeat(40), // Placeholder
-        accountAge: 0, // Would need to check real address
-        note: 'Volume-based detection (API key needed for detailed trade data)'
-      };
-      
-      if (!seenTradeIds.has(mockTrade.id)) {
-        seenTradeIds.add(mockTrade.id);
-        recentTrades.unshift(mockTrade);
-        
-        if (recentTrades.length > 100) {
-          recentTrades.pop();
-        }
-        
-        // Note: Discord alerts disabled for volume-based detection
-        console.log('⚠️  Note: Full trade tracking requires Polymarket API key');
-      }
-    }
-  } catch (error) {
-    console.error('Error detecting trades:', error.message);
-  }
-}
-
-// Main monitoring loop
-async function monitorTrades() {
-  console.log('🔍 Starting monitoring cycle...');
-  
-  try {
-    const markets = await getActiveMarkets();
+    // Trade size is the larger of the two amounts
+    const tradeSize = Math.max(parseFloat(makerAmount), parseFloat(takerAmount));
     
-    if (!markets || markets.length === 0) {
-      console.log('⚠️  No markets found');
+    // Filter by minimum trade size
+    if (tradeSize < CONFIG.MIN_TRADE_SIZE) return;
+    
+    console.log(`📊 Large trade detected: $${tradeSize.toFixed(0)}`);
+    
+    // Check both maker and taker wallet ages
+    const makerAge = await getWalletAge(maker);
+    const takerAge = await getWalletAge(taker);
+    
+    // Check if either party is a new account
+    if (makerAge > CONFIG.MAX_ACCOUNT_AGE_DAYS && takerAge > CONFIG.MAX_ACCOUNT_AGE_DAYS) {
+      console.log(`   Skipped: Both accounts too old (${makerAge}d, ${takerAge}d)`);
       return;
     }
     
-    console.log(`📊 Monitoring ${markets.length} markets (Top volume)`);
+    // Determine which account is new
+    const isNewAccount = makerAge <= CONFIG.MAX_ACCOUNT_AGE_DAYS || takerAge <= CONFIG.MAX_ACCOUNT_AGE_DAYS;
+    const newAccountAddress = makerAge <= CONFIG.MAX_ACCOUNT_AGE_DAYS ? maker : taker;
+    const accountAge = Math.min(makerAge, takerAge);
     
-    let checkedCount = 0;
-    for (const market of markets.slice(0, 15)) {
-      try {
-        await detectLargeTrades(market);
-        checkedCount++;
-        await new Promise(resolve => setTimeout(resolve, 2000));
-      } catch (err) {
-        console.error('Error processing market:', err.message);
-      }
+    if (!isNewAccount) return;
+    
+    console.log(`🐋 NEW WHALE: $${tradeSize.toFixed(0)} from ${accountAge}d old account!`);
+    
+    // Get market info
+    const tokenId = event.args.makerAssetId.toString();
+    const marketInfo = await getMarketInfo(tokenId);
+    
+    const trade = {
+      id: txHash,
+      timestamp: new Date(),
+      txHash: txHash,
+      maker: newAccountAddress,
+      amount: tradeSize,
+      accountAge: accountAge,
+      market: marketInfo.question,
+      marketSlug: marketInfo.slug,
+      blockNumber: event.blockNumber
+    };
+    
+    recentTrades.unshift(trade);
+    
+    if (recentTrades.length > 100) {
+      recentTrades.pop();
     }
     
-    console.log(`✅ Checked ${checkedCount} markets. Tracked events: ${recentTrades.length}`);
+    // Send Discord alert!
+    await sendDiscordAlert(trade);
+    
   } catch (error) {
-    console.error('❌ Monitoring error:', error.message);
+    console.error('Error processing trade:', error.message);
+  }
+}
+
+// Monitor blockchain for new trades
+async function monitorBlockchain() {
+  try {
+    const currentBlock = await provider.getBlockNumber();
+    
+    if (lastBlockChecked === 0) {
+      lastBlockChecked = currentBlock - 10; // Start from 10 blocks ago
+      console.log(`🔍 Starting blockchain monitoring from block ${lastBlockChecked}`);
+    }
+    
+    if (currentBlock <= lastBlockChecked) {
+      return; // No new blocks
+    }
+    
+    console.log(`📦 Checking blocks ${lastBlockChecked + 1} to ${currentBlock}...`);
+    
+    // Query OrderFilled events
+    const filter = ctfExchange.filters.OrderFilled();
+    const events = await ctfExchange.queryFilter(filter, lastBlockChecked + 1, currentBlock);
+    
+    console.log(`   Found ${events.length} trades in ${currentBlock - lastBlockChecked} blocks`);
+    
+    for (const event of events) {
+      await processTradeEvent(event);
+    }
+    
+    lastBlockChecked = currentBlock;
+    
+  } catch (error) {
+    console.error('❌ Blockchain monitoring error:', error.message);
   }
 }
 
@@ -237,8 +272,7 @@ app.get('/api/trades', (req, res) => {
     config: {
       minTradeSize: CONFIG.MIN_TRADE_SIZE,
       maxAccountAge: CONFIG.MAX_ACCOUNT_AGE_DAYS
-    },
-    note: 'Full trade tracking requires Polymarket API access'
+    }
   });
 });
 
@@ -251,8 +285,8 @@ app.get('/api/stats', (req, res) => {
     totalVolume: totalVolume,
     avgTradeSize: avgTradeSize,
     lastUpdate: recentTrades[0]?.timestamp || null,
-    trackedMarkets: trackedMarkets.size,
-    status: 'Volume monitoring active (API key needed for full trade data)'
+    lastBlock: lastBlockChecked,
+    mode: 'blockchain-scraper'
   });
 });
 
@@ -260,24 +294,26 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     uptime: process.uptime(),
-    trackedEvents: recentTrades.length,
-    trackedMarkets: trackedMarkets.size,
-    mode: 'volume-monitoring'
+    whaleTradesDetected: recentTrades.length,
+    lastBlock: lastBlockChecked,
+    mode: 'blockchain-monitoring'
   });
 });
 
 // Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 Polymarket Whale Tracker v2.0`);
-  console.log(`📊 Min trade size: $${CONFIG.MIN_TRADE_SIZE}`);
+app.listen(PORT, async () => {
+  console.log(`🚀 Polymarket Whale Tracker - BLOCKCHAIN EDITION`);
+  console.log(`📊 Min trade size: $${CONFIG.MIN_TRADE_SIZE.toLocaleString()}`);
   console.log(`⏰ Max account age: ${CONFIG.MAX_ACCOUNT_AGE_DAYS} days`);
-  console.log(`🔔 Discord: ${CONFIG.DISCORD_WEBHOOK ? 'Configured' : 'Not configured'}`);
-  console.log(`⚠️  Running in VOLUME MONITORING mode`);
-  console.log(`💡 For full trade tracking, Polymarket API key is required`);
+  console.log(`🔔 Discord alerts: ${CONFIG.DISCORD_WEBHOOK ? '✅ ENABLED' : '❌ Disabled'}`);
+  console.log(`⛓️  Monitoring Polygon blockchain for CTF Exchange trades...`);
+  console.log(`📍 CTF Exchange: ${CONFIG.CTF_EXCHANGE}`);
+  console.log('');
   
-  monitorTrades();
-  setInterval(monitorTrades, CONFIG.POLL_INTERVAL);
+  // Start monitoring
+  monitorBlockchain();
+  setInterval(monitorBlockchain, CONFIG.POLL_INTERVAL);
 });
 
 process.on('SIGTERM', () => {
