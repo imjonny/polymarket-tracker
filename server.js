@@ -13,45 +13,59 @@ app.use(express.json());
 const CONFIG = {
   MIN_TRADE_SIZE: process.env.MIN_TRADE_SIZE || 10000,
   MAX_ACCOUNT_AGE_DAYS: process.env.MAX_ACCOUNT_AGE_DAYS || 7,
-  DISCORD_WEBHOOK: process.env.DISCORD_WEBHOOK || '', // Add your Discord webhook
-  POLL_INTERVAL: 10000, // 10 seconds
-  POLYMARKET_API: 'https://clob.polymarket.com',
-  POLYGON_RPC: process.env.POLYGON_RPC || 'https://polygon-rpc.com'
+  DISCORD_WEBHOOK: process.env.DISCORD_WEBHOOK || '',
+  POLL_INTERVAL: 30000, // 30 seconds
+  POLYMARKET_CLOB_API: 'https://clob.polymarket.com',
+  POLYMARKET_GAMMA_API: 'https://gamma-api.polymarket.com'
 };
 
 // In-memory storage for recent trades
 const recentTrades = [];
 const seenTradeIds = new Set();
+const trackedMarkets = new Set();
 
-// Polymarket API Functions
+// Get active markets
 async function getActiveMarkets() {
   try {
-    const response = await axios.get(`${CONFIG.POLYMARKET_API}/markets`);
-    return response.data;
+    const response = await axios.get(`${CONFIG.POLYMARKET_GAMMA_API}/markets`, {
+      params: {
+        limit: 20,
+        active: true,
+        closed: false
+      }
+    });
+    
+    if (Array.isArray(response.data)) {
+      return response.data;
+    }
+    
+    console.log('Markets response format:', typeof response.data);
+    return [];
   } catch (error) {
     console.error('Error fetching markets:', error.message);
     return [];
   }
 }
 
-async function getMarketTrades(marketId) {
+// Get trades for a specific market
+async function getMarketTrades(conditionId) {
   try {
-    const response = await axios.get(`${CONFIG.POLYMARKET_API}/trades`, {
+    const response = await axios.get(`${CONFIG.POLYMARKET_CLOB_API}/trades`, {
       params: {
-        market: marketId,
-        limit: 20
+        market: conditionId,
+        limit: 50
       }
     });
-    return response.data;
+    return Array.isArray(response.data) ? response.data : [];
   } catch (error) {
-    console.error(`Error fetching trades for market ${marketId}:`, error.message);
+    console.error(`Error fetching trades for ${conditionId}:`, error.message);
     return [];
   }
 }
 
+// Check wallet age on Polygon
 async function getWalletAge(address) {
   try {
-    // Query Polygon blockchain for first transaction
     const response = await axios.get('https://api.polygonscan.com/api', {
       params: {
         module: 'account',
@@ -63,7 +77,8 @@ async function getWalletAge(address) {
         offset: 1,
         sort: 'asc',
         apikey: process.env.POLYGONSCAN_API_KEY || 'YourApiKeyToken'
-      }
+      },
+      timeout: 5000
     });
     
     if (response.data.status === '1' && response.data.result.length > 0) {
@@ -71,16 +86,19 @@ async function getWalletAge(address) {
       const ageInDays = (Date.now() / 1000 - firstTxTimestamp) / 86400;
       return Math.floor(ageInDays);
     }
-    return 0; // New account
+    return 0;
   } catch (error) {
-    console.error(`Error checking wallet age for ${address}:`, error.message);
+    console.error(`Error checking wallet age:`, error.message);
     return null;
   }
 }
 
 // Send Discord notification
 async function sendDiscordAlert(trade) {
-  if (!CONFIG.DISCORD_WEBHOOK) return;
+  if (!CONFIG.DISCORD_WEBHOOK) {
+    console.log('No Discord webhook configured');
+    return;
+  }
   
   try {
     const embed = {
@@ -97,38 +115,36 @@ async function sendDiscordAlert(trade) {
       timestamp: new Date().toISOString()
     };
 
-    await axios.post(CONFIG.DISCORD_WEBHOOK, {
-      embeds: [embed]
-    });
+    await axios.post(CONFIG.DISCORD_WEBHOOK, { embeds: [embed] });
+    console.log('✅ Discord alert sent for trade:', trade.amount);
   } catch (error) {
     console.error('Error sending Discord notification:', error.message);
   }
 }
 
 // Process and filter trades
-async function processTrade(trade, marketName) {
-  const tradeId = `${trade.id}-${trade.trader_address}`;
+async function processTrade(trade, marketName, marketSlug) {
+  const tradeId = `${trade.id || trade.transaction_hash}`;
   
-  // Skip if already seen
   if (seenTradeIds.has(tradeId)) return null;
   
-  const amount = parseFloat(trade.size) * parseFloat(trade.price);
+  const size = parseFloat(trade.size || 0);
+  const price = parseFloat(trade.price || 0);
+  const amount = size * price;
   
-  // Filter by minimum size
   if (amount < CONFIG.MIN_TRADE_SIZE) return null;
   
-  // Check wallet age
-  const accountAge = await getWalletAge(trade.trader_address);
+  const accountAge = await getWalletAge(trade.maker_address || trade.trader_address);
   if (accountAge === null || accountAge > CONFIG.MAX_ACCOUNT_AGE_DAYS) return null;
   
   const processedTrade = {
     id: tradeId,
-    timestamp: new Date(trade.timestamp),
-    market: marketName,
+    timestamp: new Date(trade.created_at || trade.timestamp || Date.now()),
+    market: marketName || marketSlug || 'Unknown Market',
     outcome: trade.side === 'BUY' ? 'YES' : 'NO',
     amount: amount,
-    price: parseFloat(trade.price).toFixed(2),
-    address: trade.trader_address,
+    price: price.toFixed(2),
+    address: trade.maker_address || trade.trader_address,
     accountAge: accountAge,
     txHash: trade.transaction_hash
   };
@@ -136,12 +152,11 @@ async function processTrade(trade, marketName) {
   seenTradeIds.add(tradeId);
   recentTrades.unshift(processedTrade);
   
-  // Keep only last 100 trades in memory
   if (recentTrades.length > 100) {
     recentTrades.pop();
   }
   
-  // Send alert
+  console.log(`🐋 Large trade detected: $${amount.toFixed(0)} on ${marketName}`);
   await sendDiscordAlert(processedTrade);
   
   return processedTrade;
@@ -149,22 +164,43 @@ async function processTrade(trade, marketName) {
 
 // Main monitoring loop
 async function monitorTrades() {
-  console.log('🔍 Starting trade monitoring...');
+  console.log('🔍 Starting trade monitoring cycle...');
   
   try {
     const markets = await getActiveMarkets();
-    console.log(`Monitoring ${markets.length} markets`);
     
-    for (const market of markets.slice(0, 10)) { // Monitor top 10 markets
-      const trades = await getMarketTrades(market.condition_id);
-      
-      for (const trade of trades) {
-        await processTrade(trade, market.question);
-      }
-      
-      // Rate limiting
-      await new Promise(resolve => setTimeout(resolve, 500));
+    if (!markets || markets.length === 0) {
+      console.log('⚠️  No markets found, will retry...');
+      return;
     }
+    
+    console.log(`📊 Monitoring ${Math.min(markets.length, 10)} active markets`);
+    
+    for (const market of markets.slice(0, 10)) {
+      try {
+        const conditionId = market.condition_id || market.clobTokenIds?.[0];
+        const marketName = market.question || market.title;
+        
+        if (!conditionId) continue;
+        
+        if (!trackedMarkets.has(conditionId)) {
+          console.log(`📈 Tracking: ${marketName}`);
+          trackedMarkets.add(conditionId);
+        }
+        
+        const trades = await getMarketTrades(conditionId);
+        
+        for (const trade of trades) {
+          await processTrade(trade, marketName, market.slug);
+        }
+        
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      } catch (err) {
+        console.error('Error processing market:', err.message);
+      }
+    }
+    
+    console.log(`✅ Monitoring cycle complete. Tracking ${recentTrades.length} whale trades`);
   } catch (error) {
     console.error('Error in monitoring loop:', error.message);
   }
@@ -190,7 +226,8 @@ app.get('/api/stats', (req, res) => {
     totalTrades: recentTrades.length,
     totalVolume: totalVolume,
     avgTradeSize: avgTradeSize,
-    lastUpdate: recentTrades[0]?.timestamp || null
+    lastUpdate: recentTrades[0]?.timestamp || null,
+    trackedMarkets: trackedMarkets.size
   });
 });
 
@@ -205,21 +242,27 @@ app.post('/api/config', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime() });
+  res.json({ 
+    status: 'ok', 
+    uptime: process.uptime(),
+    trackedTrades: recentTrades.length,
+    trackedMarkets: trackedMarkets.size
+  });
 });
 
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🚀 Polymarket Whale Tracker running on port ${PORT}`);
+  console.log(`📊 Min trade size: $${CONFIG.MIN_TRADE_SIZE}`);
+  console.log(`⏰ Max account age: ${CONFIG.MAX_ACCOUNT_AGE_DAYS} days`);
+  console.log(`🔔 Discord alerts: ${CONFIG.DISCORD_WEBHOOK ? 'Enabled' : 'Disabled'}`);
   
-  // Start monitoring
   monitorTrades();
   setInterval(monitorTrades, CONFIG.POLL_INTERVAL);
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('👋 SIGTERM received, shutting down gracefully');
+  console.log('👋 Shutting down gracefully');
   process.exit(0);
 });
