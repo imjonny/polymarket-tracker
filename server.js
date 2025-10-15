@@ -115,10 +115,12 @@ async function sendDiscordAlert(trade) {
   
   try {
     const accountAgeEmoji = trade.accountAge <= 1 ? '🆕' : trade.accountAge <= 7 ? '⚠️' : '✅';
+    const outcomeEmoji = trade.outcome === 'YES' ? '📈' : '📉';
+    const outcomeColor = trade.outcome === 'YES' ? 0x00FF00 : 0xFF0000; // Green for YES, Red for NO
     
     const embed = {
       title: '🐋 WHALE ALERT - New Account Large Trade!',
-      color: 0xFF6B00, // Orange
+      color: outcomeColor,
       fields: [
         { 
           name: '📊 Market', 
@@ -126,8 +128,13 @@ async function sendDiscordAlert(trade) {
           inline: false 
         },
         { 
+          name: `${outcomeEmoji} Betting On`, 
+          value: `**${trade.outcome}**`, 
+          inline: true 
+        },
+        { 
           name: '💰 Trade Amount', 
-          value: `**$${trade.amount.toLocaleString()}**`, 
+          value: `**${trade.amount.toLocaleString()}**`, 
           inline: true 
         },
         { 
@@ -151,7 +158,7 @@ async function sendDiscordAlert(trade) {
     };
 
     await axios.post(CONFIG.DISCORD_WEBHOOK, { 
-      content: `@everyone 🚨 **NEW WHALE DETECTED!** Account less than ${CONFIG.MAX_ACCOUNT_AGE_DAYS} days old made a **$${trade.amount.toLocaleString()}** trade!`,
+      content: `@everyone 🚨 **NEW WHALE DETECTED!** Account less than ${CONFIG.MAX_ACCOUNT_AGE_DAYS} days old made a **${trade.amount.toLocaleString()}** trade betting **${trade.outcome}**!`,
       embeds: [embed] 
     });
     
@@ -171,11 +178,18 @@ async function processTradeEvent(event) {
     
     const maker = event.args.maker;
     const taker = event.args.taker;
+    const makerAssetId = event.args.makerAssetId.toString();
+    const takerAssetId = event.args.takerAssetId.toString();
     const makerAmount = ethers.formatUnits(event.args.makerAmountFilled, 6); // USDC has 6 decimals
     const takerAmount = ethers.formatUnits(event.args.takerAmountFilled, 6);
     
     // Trade size is the larger of the two amounts
     const tradeSize = Math.max(parseFloat(makerAmount), parseFloat(takerAmount));
+    
+    // Determine which side they're buying (YES or NO)
+    // In Polymarket, lower token ID is typically YES, higher is NO
+    const isBuyingYes = makerAssetId < takerAssetId;
+    const outcome = isBuyingYes ? 'YES' : 'NO';
     
     // Filter by minimum trade size
     if (tradeSize < CONFIG.MIN_TRADE_SIZE) return;
@@ -219,6 +233,7 @@ async function processTradeEvent(event) {
       maker: newAccountAddress,
       amount: tradeSize,
       accountAge: accountAge,
+      outcome: outcome,
       market: marketInfo.question,
       marketSlug: marketInfo.slug,
       blockNumber: event.blockNumber
