@@ -52,14 +52,20 @@ async function getMarketInfo(tokenId) {
   }
   
   try {
-    const response = await axios.get(`${CONFIG.GAMMA_API}/markets`);
+    const response = await axios.get(`${CONFIG.GAMMA_API}/markets`, {
+      params: {
+        active: true,
+        closed: false
+      }
+    });
     if (Array.isArray(response.data)) {
       for (const market of response.data) {
         const tokens = market.clobTokenIds || [];
         if (tokens.includes(tokenId)) {
           const info = {
             question: market.question || market.title,
-            slug: market.slug
+            slug: market.slug,
+            active: market.active !== false && market.closed !== true
           };
           marketCache.set(tokenId, info);
           return info;
@@ -70,7 +76,8 @@ async function getMarketInfo(tokenId) {
     console.error('Error fetching market info:', error.message);
   }
   
-  return { question: 'Unknown Market', slug: '' };
+  // If not found in active markets, it's probably closed/resolved
+  return { question: 'Unknown Market', slug: '', active: false };
 }
 
 // Check wallet age on Polygon
