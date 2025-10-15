@@ -198,24 +198,21 @@ async function processTradeEvent(event) {
     // Trade size is the larger of the two amounts
     const tradeSize = Math.max(parseFloat(makerAmount), parseFloat(takerAmount));
     
-    // Determine YES/NO based on which token is being bought
+    // Determine which token is being bought
     // If makerAssetId is 0, maker is BUYING (paying USDC, getting tokens)
     // If takerAssetId is 0, taker is BUYING (paying USDC, getting tokens)
-    let outcome = 'UNKNOWN';
-    let tokenId = '';
+    let tradedTokenId = '';
     
     if (makerAssetId === '0') {
-      // Maker is buying, taker is selling
-      // Maker gets takerAssetId tokens
-      tokenId = takerAssetId;
+      // Maker is buying, taker is selling - maker gets takerAssetId tokens
+      tradedTokenId = takerAssetId;
     } else if (takerAssetId === '0') {
-      // Taker is buying, maker is selling
-      // Taker gets makerAssetId tokens
-      tokenId = makerAssetId;
+      // Taker is buying, maker is selling - taker gets makerAssetId tokens
+      tradedTokenId = makerAssetId;
+    } else {
+      // Both are tokens (merge/burn scenario) - use makerAssetId
+      tradedTokenId = makerAssetId;
     }
-    
-    // We'll determine YES vs NO from the market API when we fetch market info
-    // For now, store the tokenId
     
     // Filter by minimum trade size
     if (tradeSize < CONFIG.MIN_TRADE_SIZE) return;
@@ -249,7 +246,7 @@ async function processTradeEvent(event) {
     console.log(`   Trade happened ${secondsAgo} seconds ago`);
     
     // Get market info and determine YES/NO
-    const marketInfo = await getMarketInfo(tokenId);
+    const marketInfo = await getMarketInfo(tradedTokenId);
     
     // Skip if market is closed/resolved
     if (!marketInfo.active) {
@@ -257,7 +254,7 @@ async function processTradeEvent(event) {
       return;
     }
     
-    const outcome = marketInfo.outcome || 'UNKNOWN';
+    const tradeOutcome = marketInfo.outcome || 'UNKNOWN';
     
     const trade = {
       id: txHash,
@@ -266,7 +263,7 @@ async function processTradeEvent(event) {
       maker: newAccountAddress,
       amount: tradeSize,
       accountAge: accountAge,
-      outcome: outcome,
+      outcome: tradeOutcome,
       market: marketInfo.question,
       marketSlug: marketInfo.slug,
       blockNumber: event.blockNumber
