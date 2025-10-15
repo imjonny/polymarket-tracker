@@ -199,7 +199,14 @@ async function processTradeEvent(event) {
     
     if (!isNewAccount) return;
     
-    console.log(`🐋 NEW WHALE: $${tradeSize.toFixed(0)} from ${accountAge}d old account!`);
+    console.log(`🐋 NEW WHALE: ${tradeSize.toFixed(0)} from ${accountAge}d old account!`);
+    
+    // Get block timestamp to show how recent the trade is
+    const block = await provider.getBlock(event.blockNumber);
+    const tradeTime = new Date(block.timestamp * 1000);
+    const secondsAgo = Math.floor((Date.now() - tradeTime.getTime()) / 1000);
+    
+    console.log(`   Trade happened ${secondsAgo} seconds ago`);
     
     // Get market info
     const tokenId = event.args.makerAssetId.toString();
@@ -237,8 +244,10 @@ async function monitorBlockchain() {
     const currentBlock = await provider.getBlockNumber();
     
     if (lastBlockChecked === 0) {
-      lastBlockChecked = currentBlock - 10; // Start from 10 blocks ago
-      console.log(`🔍 Starting blockchain monitoring from block ${lastBlockChecked}`);
+      lastBlockChecked = currentBlock; // Start from current block only
+      console.log(`🔍 Starting blockchain monitoring from block ${lastBlockChecked} (live mode)`);
+      console.log(`⚠️  Only NEW trades from this point forward will trigger alerts`);
+      return; // Skip first cycle to avoid alerting on old trades
     }
     
     if (currentBlock <= lastBlockChecked) {
