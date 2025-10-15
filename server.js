@@ -233,6 +233,12 @@ async function processTradeEvent(event) {
     const tokenId = event.args.makerAssetId.toString();
     const marketInfo = await getMarketInfo(tokenId);
     
+    // Skip if market is closed/resolved
+    if (!marketInfo.active) {
+      console.log(`   Skipped: Market is closed/resolved`);
+      return;
+    }
+    
     const trade = {
       id: txHash,
       timestamp: new Date(),
