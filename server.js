@@ -1,10 +1,9 @@
-// server.js - Polymarket Whale Tracker with Blockchain Scraper
-// Monitors Polymarket trades directly from Polygon blockchain
+// server.js - Kalshi Whale Tracker
+// Monitors Kalshi for large trades and volume spikes
 
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const { ethers } = require('ethers');
 
 const app = express();
 app.use(cors());
@@ -12,335 +11,319 @@ app.use(express.json());
 
 // Configuration
 const CONFIG = {
-  MIN_TRADE_SIZE: parseInt(process.env.MIN_TRADE_SIZE) || 10000,
-  MAX_ACCOUNT_AGE_DAYS: parseInt(process.env.MAX_ACCOUNT_AGE_DAYS) || 7,
+  MIN_TRADE_SIZE: parseInt(process.env.MIN_TRADE_SIZE) || 15000, // $15k minimum
+  VOLUME_SPIKE_THRESHOLD: parseInt(process.env.VOLUME_SPIKE_THRESHOLD) || 50000, // $50k volume spike
   DISCORD_WEBHOOK: process.env.DISCORD_WEBHOOK || '',
-  POLL_INTERVAL: 15000, // 15 seconds
-  
-  // Polymarket Contracts on Polygon
-  CTF_EXCHANGE: '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E',
-  CONDITIONAL_TOKENS: '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045',
-  
-  // Polygon RPC
-  POLYGON_RPC: process.env.POLYGON_RPC || 'https://polygon-rpc.com',
-  
-  // APIs
-  GAMMA_API: 'https://gamma-api.polymarket.com',
-  POLYGONSCAN_KEY: process.env.POLYGONSCAN_API_KEY || 'YourApiKeyToken'
+  POLL_INTERVAL: 30000, // 30 seconds
+  KALSHI_API: 'https://api.elections.kalshi.com/trade-api/v2'
 };
 
 // In-memory storage
-const recentTrades = [];
-const seenTxHashes = new Set();
-const marketCache = new Map();
-let lastBlockChecked = 0;
+const recentWhales = [];
+const marketCache = new Map(); // Store previous market states
+const seenAlerts = new Set();
 
-// Initialize Polygon provider
-const provider = new ethers.JsonRpcProvider(CONFIG.POLYGON_RPC);
-
-// CTF Exchange ABI (OrderFilled event)
-const CTF_EXCHANGE_ABI = [
-  'event OrderFilled(bytes32 indexed orderHash, address indexed maker, address indexed taker, uint256 makerAssetId, uint256 takerAssetId, uint256 makerAmountFilled, uint256 takerAmountFilled, uint256 fee)'
-];
-
-const ctfExchange = new ethers.Contract(CONFIG.CTF_EXCHANGE, CTF_EXCHANGE_ABI, provider);
-
-// Get market info from Gamma API
-async function getMarketInfo(tokenId) {
-  if (marketCache.has(tokenId)) {
-    return marketCache.get(tokenId);
-  }
-  
+// Get active markets
+async function getActiveMarkets() {
   try {
-    const response = await axios.get(`${CONFIG.GAMMA_API}/markets`, {
+    const response = await axios.get(`${CONFIG.KALSHI_API}/markets`, {
       params: {
-        active: true,
-        closed: false
-      }
+        status: 'open',
+        limit: 100
+      },
+      timeout: 10000
     });
-    if (Array.isArray(response.data)) {
-      for (const market of response.data) {
-        const tokens = market.clobTokenIds || [];
-        // Find which position this token represents
-        const tokenIndex = tokens.indexOf(tokenId);
-        if (tokenIndex !== -1) {
-          // Token 0 is YES, Token 1 is NO (based on Polymarket convention)
-          const outcome = tokenIndex === 0 ? 'YES' : 'NO';
-          const info = {
-            question: market.question || market.title,
-            slug: market.slug,
-            active: market.active !== false && market.closed !== true,
-            outcome: outcome
-          };
-          marketCache.set(tokenId, info);
-          return info;
-        }
-      }
-    }
+    
+    return response.data.markets || [];
   } catch (error) {
-    console.error('Error fetching market info:', error.message);
+    console.error('Error fetching markets:', error.message);
+    return [];
   }
-  
-  // If not found in active markets, it's probably closed/resolved
-  return { question: 'Unknown Market', slug: '', active: false, outcome: 'UNKNOWN' };
 }
 
-// Check wallet age on Polygon
-async function getWalletAge(address) {
+// Get orderbook for a specific market
+async function getOrderbook(ticker) {
   try {
-    const response = await axios.get('https://api.polygonscan.com/api', {
-      params: {
-        module: 'account',
-        action: 'txlist',
-        address: address,
-        startblock: 0,
-        endblock: 99999999,
-        page: 1,
-        offset: 1,
-        sort: 'asc',
-        apikey: CONFIG.POLYGONSCAN_KEY
-      },
-      timeout: 8000
+    const response = await axios.get(`${CONFIG.KALSHI_API}/markets/${ticker}/orderbook`, {
+      timeout: 10000
     });
     
-    if (response.data.status === '1' && response.data.result.length > 0) {
-      const firstTxTimestamp = parseInt(response.data.result[0].timeStamp);
-      const ageInDays = (Date.now() / 1000 - firstTxTimestamp) / 86400;
-      return Math.floor(ageInDays);
-    }
-    
-    // No transactions found - brand new wallet!
-    return 0;
+    return response.data.orderbook || null;
   } catch (error) {
-    console.error('Wallet age check error:', error.message);
-    // If we can't check, assume it's new to be safe
-    return 0;
+    console.error(`Error fetching orderbook for ${ticker}:`, error.message);
+    return null;
   }
+}
+
+// Calculate total orderbook size
+function calculateOrderbookSize(orderbook) {
+  if (!orderbook) return { yesSize: 0, noSize: 0 };
+  
+  const yesSize = (orderbook.yes || []).reduce((sum, order) => {
+    // order format: [price_in_cents, quantity]
+    return sum + (order[0] * order[1] / 100); // Convert cents to dollars
+  }, 0);
+  
+  const noSize = (orderbook.no || []).reduce((sum, order) => {
+    return sum + (order[0] * order[1] / 100);
+  }, 0);
+  
+  return { yesSize, noSize };
 }
 
 // Send Discord alert
-async function sendDiscordAlert(trade) {
+async function sendDiscordAlert(whale) {
   if (!CONFIG.DISCORD_WEBHOOK) {
     console.log('⚠️  Discord webhook not configured');
     return;
   }
   
   try {
-    const accountAgeEmoji = trade.accountAge <= 1 ? '🆕' : trade.accountAge <= 7 ? '⚠️' : '✅';
-    const outcomeEmoji = trade.outcome === 'YES' ? '📈' : '📉';
-    const outcomeColor = trade.outcome === 'YES' ? 0x00FF00 : 0xFF0000; // Green for YES, Red for NO
+    const outcomeEmoji = whale.outcome === 'YES' ? '📈' : '📉';
+    const outcomeColor = whale.outcome === 'YES' ? 0x00FF00 : 0xFF0000;
+    const alertType = whale.type === 'large_order' ? '💰 LARGE ORDER' : '📊 VOLUME SPIKE';
     
     const embed = {
-      title: '🐋 WHALE ALERT - New Account Large Trade!',
+      title: `🐋 KALSHI WHALE ALERT - ${alertType}`,
       color: outcomeColor,
       fields: [
         { 
           name: '📊 Market', 
-          value: trade.market || 'Loading...', 
+          value: whale.marketTitle || whale.ticker, 
           inline: false 
         },
         { 
-          name: `${outcomeEmoji} Betting On`, 
-          value: `**${trade.outcome}**`, 
+          name: `${outcomeEmoji} Side`, 
+          value: `**${whale.outcome}**`, 
           inline: true 
         },
         { 
-          name: '💰 Trade Amount', 
-          value: `**${trade.amount.toLocaleString()}**`, 
+          name: '💰 Size', 
+          value: `**$${whale.amount.toLocaleString()}**`, 
           inline: true 
         },
         { 
-          name: `${accountAgeEmoji} Account Age`, 
-          value: `**${trade.accountAge} days**`, 
+          name: '💵 Price', 
+          value: `${whale.price}¢`, 
           inline: true 
         },
         { 
-          name: '👤 Trader Wallet', 
-          value: `\`${trade.maker.slice(0, 8)}...${trade.maker.slice(-6)}\``, 
-          inline: false 
-        },
-        { 
-          name: '🔗 Transaction', 
-          value: `[View on Polygonscan](https://polygonscan.com/tx/${trade.txHash})`, 
+          name: '🎯 Kalshi Link', 
+          value: `**[→ View Market & Trade ←](https://kalshi.com/markets/${whale.ticker})**`, 
           inline: false 
         }
       ],
       timestamp: new Date().toISOString(),
-      footer: { text: 'Polymarket Whale Tracker | Live Blockchain Monitoring' }
+      footer: { text: 'Kalshi Whale Tracker | Live Order Monitoring' }
     };
 
     await axios.post(CONFIG.DISCORD_WEBHOOK, { 
-      content: `@everyone 🚨 **NEW WHALE DETECTED!** Account less than ${CONFIG.MAX_ACCOUNT_AGE_DAYS} days old made a **${trade.amount.toLocaleString()}** trade betting **${trade.outcome}**!`,
+      content: `@everyone 🚨 **${alertType}** detected! $${whale.amount.toLocaleString()} on ${whale.outcome}!`,
       embeds: [embed] 
     });
     
-    console.log(`✅ Discord alert sent! $${trade.amount.toFixed(0)} from ${trade.accountAge}d old account`);
+    console.log(`✅ Discord alert sent: $${whale.amount.toFixed(0)} ${whale.outcome} on ${whale.ticker}`);
   } catch (error) {
     console.error('❌ Discord alert failed:', error.message);
   }
 }
 
-// Process OrderFilled event
-async function processTradeEvent(event) {
-  try {
-    const txHash = event.transactionHash;
-    
-    if (seenTxHashes.has(txHash)) return;
-    seenTxHashes.add(txHash);
-    
-    const maker = event.args.maker;
-    const taker = event.args.taker;
-    const makerAssetId = event.args.makerAssetId.toString();
-    const takerAssetId = event.args.takerAssetId.toString();
-    const makerAmount = ethers.formatUnits(event.args.makerAmountFilled, 6); // USDC has 6 decimals
-    const takerAmount = ethers.formatUnits(event.args.takerAmountFilled, 6);
-    
-    // Trade size is the larger of the two amounts
-    const tradeSize = Math.max(parseFloat(makerAmount), parseFloat(takerAmount));
-    
-    // Determine which token is being bought
-    // If makerAssetId is 0, maker is BUYING (paying USDC, getting tokens)
-    // If takerAssetId is 0, taker is BUYING (paying USDC, getting tokens)
-    let tradedTokenId = '';
-    
-    if (makerAssetId === '0') {
-      // Maker is buying, taker is selling - maker gets takerAssetId tokens
-      tradedTokenId = takerAssetId;
-    } else if (takerAssetId === '0') {
-      // Taker is buying, maker is selling - taker gets makerAssetId tokens
-      tradedTokenId = makerAssetId;
-    } else {
-      // Both are tokens (merge/burn scenario) - use makerAssetId
-      tradedTokenId = makerAssetId;
+// Detect large orders in orderbook
+function detectLargeOrders(market, orderbook) {
+  const whales = [];
+  const { yesSize, noSize } = calculateOrderbookSize(orderbook);
+  
+  // Check YES side for large orders
+  if (orderbook.yes) {
+    for (const order of orderbook.yes) {
+      const [price, quantity] = order;
+      const orderValue = (price * quantity) / 100; // Convert to dollars
+      
+      if (orderValue >= CONFIG.MIN_TRADE_SIZE) {
+        const alertId = `${market.ticker}-YES-${price}-${quantity}`;
+        if (!seenAlerts.has(alertId)) {
+          seenAlerts.add(alertId);
+          whales.push({
+            type: 'large_order',
+            ticker: market.ticker,
+            marketTitle: market.title,
+            outcome: 'YES',
+            amount: orderValue,
+            price: price,
+            timestamp: new Date()
+          });
+        }
+      }
     }
-    
-    // Filter by minimum trade size
-    if (tradeSize < CONFIG.MIN_TRADE_SIZE) return;
-    
-    console.log(`📊 Large trade detected: $${tradeSize.toFixed(0)}`);
-    
-    // Check both maker and taker wallet ages
-    const makerAge = await getWalletAge(maker);
-    const takerAge = await getWalletAge(taker);
-    
-    // Check if either party is a new account
-    if (makerAge > CONFIG.MAX_ACCOUNT_AGE_DAYS && takerAge > CONFIG.MAX_ACCOUNT_AGE_DAYS) {
-      console.log(`   Skipped: Both accounts too old (${makerAge}d, ${takerAge}d)`);
-      return;
-    }
-    
-    // Determine which account is new
-    const isNewAccount = makerAge <= CONFIG.MAX_ACCOUNT_AGE_DAYS || takerAge <= CONFIG.MAX_ACCOUNT_AGE_DAYS;
-    const newAccountAddress = makerAge <= CONFIG.MAX_ACCOUNT_AGE_DAYS ? maker : taker;
-    const accountAge = Math.min(makerAge, takerAge);
-    
-    if (!isNewAccount) return;
-    
-    console.log(`🐋 NEW WHALE: ${tradeSize.toFixed(0)} from ${accountAge}d old account!`);
-    
-    // Get block timestamp to show how recent the trade is
-    const block = await provider.getBlock(event.blockNumber);
-    const tradeTime = new Date(block.timestamp * 1000);
-    const secondsAgo = Math.floor((Date.now() - tradeTime.getTime()) / 1000);
-    
-    console.log(`   Trade happened ${secondsAgo} seconds ago`);
-    
-    // Get market info and determine YES/NO
-    const marketInfo = await getMarketInfo(tradedTokenId);
-    
-    // Skip if market is closed/resolved
-    if (!marketInfo.active) {
-      console.log(`   Skipped: Market is closed/resolved`);
-      return;
-    }
-    
-    const tradeOutcome = marketInfo.outcome || 'UNKNOWN';
-    
-    const trade = {
-      id: txHash,
-      timestamp: new Date(),
-      txHash: txHash,
-      maker: newAccountAddress,
-      amount: tradeSize,
-      accountAge: accountAge,
-      outcome: tradeOutcome,
-      market: marketInfo.question,
-      marketSlug: marketInfo.slug,
-      blockNumber: event.blockNumber
-    };
-    
-    recentTrades.unshift(trade);
-    
-    if (recentTrades.length > 100) {
-      recentTrades.pop();
-    }
-    
-    // Send Discord alert!
-    await sendDiscordAlert(trade);
-    
-  } catch (error) {
-    console.error('Error processing trade:', error.message);
   }
+  
+  // Check NO side for large orders
+  if (orderbook.no) {
+    for (const order of orderbook.no) {
+      const [price, quantity] = order;
+      const orderValue = (price * quantity) / 100;
+      
+      if (orderValue >= CONFIG.MIN_TRADE_SIZE) {
+        const alertId = `${market.ticker}-NO-${price}-${quantity}`;
+        if (!seenAlerts.has(alertId)) {
+          seenAlerts.add(alertId);
+          whales.push({
+            type: 'large_order',
+            ticker: market.ticker,
+            marketTitle: market.title,
+            outcome: 'NO',
+            amount: orderValue,
+            price: price,
+            timestamp: new Date()
+          });
+        }
+      }
+    }
+  }
+  
+  return whales;
 }
 
-// Monitor blockchain for new trades
-async function monitorBlockchain() {
+// Detect volume spikes
+function detectVolumeSpike(market) {
+  const currentVolume = market.volume || 0;
+  const previousState = marketCache.get(market.ticker);
+  
+  if (!previousState) {
+    // First time seeing this market, just cache it
+    marketCache.set(market.ticker, {
+      volume: currentVolume,
+      timestamp: Date.now()
+    });
+    return null;
+  }
+  
+  const volumeIncrease = currentVolume - previousState.volume;
+  const timeDiff = (Date.now() - previousState.timestamp) / 1000; // seconds
+  
+  // Update cache
+  marketCache.set(market.ticker, {
+    volume: currentVolume,
+    timestamp: Date.now()
+  });
+  
+  // Alert if volume increased by threshold amount
+  if (volumeIncrease >= CONFIG.VOLUME_SPIKE_THRESHOLD) {
+    const alertId = `${market.ticker}-volume-${currentVolume}`;
+    if (!seenAlerts.has(alertId)) {
+      seenAlerts.add(alertId);
+      
+      // Determine likely side based on price movement
+      const outcome = market.yes_price > 50 ? 'YES' : 'NO';
+      
+      return {
+        type: 'volume_spike',
+        ticker: market.ticker,
+        marketTitle: market.title,
+        outcome: outcome,
+        amount: volumeIncrease,
+        price: market.yes_price || 0,
+        timestamp: new Date()
+      };
+    }
+  }
+  
+  return null;
+}
+
+// Main monitoring loop
+async function monitorKalshi() {
+  console.log('🔍 Checking Kalshi markets...');
+  
   try {
-    const currentBlock = await provider.getBlockNumber();
+    const markets = await getActiveMarkets();
     
-    if (lastBlockChecked === 0) {
-      lastBlockChecked = currentBlock; // Start from current block only
-      console.log(`🔍 Starting blockchain monitoring from block ${lastBlockChecked} (live mode)`);
-      console.log(`⚠️  Only NEW trades from this point forward will trigger alerts`);
-      return; // Skip first cycle to avoid alerting on old trades
+    if (!markets || markets.length === 0) {
+      console.log('⚠️  No active markets found');
+      return;
     }
     
-    if (currentBlock <= lastBlockChecked) {
-      return; // No new blocks
+    console.log(`📊 Monitoring ${markets.length} active markets`);
+    
+    let checkedCount = 0;
+    let whalesFound = 0;
+    
+    // Check high-volume markets first
+    const sortedMarkets = markets
+      .filter(m => m.volume > 10000) // Only check markets with >$10k volume
+      .sort((a, b) => b.volume - a.volume)
+      .slice(0, 30); // Check top 30 by volume
+    
+    for (const market of sortedMarkets) {
+      try {
+        // Check for volume spikes
+        const volumeWhale = detectVolumeSpike(market);
+        if (volumeWhale) {
+          recentWhales.unshift(volumeWhale);
+          await sendDiscordAlert(volumeWhale);
+          whalesFound++;
+        }
+        
+        // Check orderbook for large orders
+        const orderbook = await getOrderbook(market.ticker);
+        if (orderbook) {
+          const orderWhales = detectLargeOrders(market, orderbook);
+          for (const whale of orderWhales) {
+            recentWhales.unshift(whale);
+            await sendDiscordAlert(whale);
+            whalesFound++;
+          }
+        }
+        
+        checkedCount++;
+        
+        // Rate limiting
+        await new Promise(resolve => setTimeout(resolve, 500));
+      } catch (err) {
+        console.error(`Error processing ${market.ticker}:`, err.message);
+      }
     }
     
-    console.log(`📦 Checking blocks ${lastBlockChecked + 1} to ${currentBlock}...`);
-    
-    // Query OrderFilled events
-    const filter = ctfExchange.filters.OrderFilled();
-    const events = await ctfExchange.queryFilter(filter, lastBlockChecked + 1, currentBlock);
-    
-    console.log(`   Found ${events.length} trades in ${currentBlock - lastBlockChecked} blocks`);
-    
-    for (const event of events) {
-      await processTradeEvent(event);
+    // Cleanup old alerts (keep last 1000)
+    if (seenAlerts.size > 1000) {
+      const alerts = Array.from(seenAlerts);
+      seenAlerts.clear();
+      alerts.slice(-500).forEach(id => seenAlerts.add(id));
     }
     
-    lastBlockChecked = currentBlock;
+    // Keep only last 100 whales
+    if (recentWhales.length > 100) {
+      recentWhales.splice(100);
+    }
     
+    console.log(`✅ Checked ${checkedCount} markets. Found ${whalesFound} whales.`);
   } catch (error) {
-    console.error('❌ Blockchain monitoring error:', error.message);
+    console.error('❌ Monitoring error:', error.message);
   }
 }
 
 // API Endpoints
-app.get('/api/trades', (req, res) => {
+app.get('/api/whales', (req, res) => {
   res.json({
-    trades: recentTrades,
-    count: recentTrades.length,
+    whales: recentWhales,
+    count: recentWhales.length,
     config: {
       minTradeSize: CONFIG.MIN_TRADE_SIZE,
-      maxAccountAge: CONFIG.MAX_ACCOUNT_AGE_DAYS
+      volumeSpikeThreshold: CONFIG.VOLUME_SPIKE_THRESHOLD
     }
   });
 });
 
 app.get('/api/stats', (req, res) => {
-  const totalVolume = recentTrades.reduce((sum, t) => sum + t.amount, 0);
-  const avgTradeSize = recentTrades.length > 0 ? totalVolume / recentTrades.length : 0;
+  const totalVolume = recentWhales.reduce((sum, w) => sum + w.amount, 0);
+  const avgWhaleSize = recentWhales.length > 0 ? totalVolume / recentWhales.length : 0;
   
   res.json({
-    totalTrades: recentTrades.length,
+    totalWhales: recentWhales.length,
     totalVolume: totalVolume,
-    avgTradeSize: avgTradeSize,
-    lastUpdate: recentTrades[0]?.timestamp || null,
-    lastBlock: lastBlockChecked,
-    mode: 'blockchain-scraper'
+    avgWhaleSize: avgWhaleSize,
+    lastUpdate: recentWhales[0]?.timestamp || null,
+    trackedMarkets: marketCache.size
   });
 });
 
@@ -348,26 +331,25 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     uptime: process.uptime(),
-    whaleTradesDetected: recentTrades.length,
-    lastBlock: lastBlockChecked,
-    mode: 'blockchain-monitoring'
+    whalesDetected: recentWhales.length,
+    trackedMarkets: marketCache.size,
+    mode: 'kalshi-monitoring'
   });
 });
 
 // Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
-  console.log(`🚀 Polymarket Whale Tracker - BLOCKCHAIN EDITION`);
-  console.log(`📊 Min trade size: $${CONFIG.MIN_TRADE_SIZE.toLocaleString()}`);
-  console.log(`⏰ Max account age: ${CONFIG.MAX_ACCOUNT_AGE_DAYS} days`);
-  console.log(`🔔 Discord alerts: ${CONFIG.DISCORD_WEBHOOK ? '✅ ENABLED' : '❌ Disabled'}`);
-  console.log(`⛓️  Monitoring Polygon blockchain for CTF Exchange trades...`);
-  console.log(`📍 CTF Exchange: ${CONFIG.CTF_EXCHANGE}`);
+app.listen(PORT, () => {
+  console.log(`🚀 Kalshi Whale Tracker LIVE`);
+  console.log(`💰 Min order size: $${CONFIG.MIN_TRADE_SIZE.toLocaleString()}`);
+  console.log(`📊 Volume spike threshold: $${CONFIG.VOLUME_SPIKE_THRESHOLD.toLocaleString()}`);
+  console.log(`🔔 Discord alerts: ${CONFIG.DISCORD_WEBHOOK ? '✅ Enabled' : '❌ Disabled'}`);
+  console.log(`🎯 Monitoring Kalshi via public API...`);
   console.log('');
   
   // Start monitoring
-  monitorBlockchain();
-  setInterval(monitorBlockchain, CONFIG.POLL_INTERVAL);
+  monitorKalshi();
+  setInterval(monitorKalshi, CONFIG.POLL_INTERVAL);
 });
 
 process.on('SIGTERM', () => {
