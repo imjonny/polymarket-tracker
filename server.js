@@ -245,6 +245,13 @@ async function monitorKalshi() {
     
     console.log(`📊 Monitoring ${markets.length} active markets`);
     
+    // Debug: Show volume of top 5 markets
+    const topMarkets = markets.slice(0, 5);
+    console.log('Top 5 markets by listing:');
+    topMarkets.forEach(m => {
+      console.log(`  - ${m.ticker}: volume=${m.volume || 0}`);
+    });
+    
     let checkedCount = 0;
     let whalesFound = 0;
     
