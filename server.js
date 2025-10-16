@@ -250,9 +250,9 @@ async function monitorKalshi() {
     
     // Check high-volume markets first
     const sortedMarkets = markets
-      .filter(m => m.volume > 10000) // Only check markets with >$10k volume
+      .filter(m => m.volume > 1000) // Only check markets with >$1k volume
       .sort((a, b) => b.volume - a.volume)
-      .slice(0, 30); // Check top 30 by volume
+      .slice(0, 50); // Check top 50 by volume
     
     for (const market of sortedMarkets) {
       try {
