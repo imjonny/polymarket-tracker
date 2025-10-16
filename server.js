@@ -1,5 +1,5 @@
 // server.js - Kalshi Whale Tracker
-// Monitors Kalshi for large trades and volume spikes
+// Monitors Kalshi for large trades
 
 const express = require('express');
 const cors = require('cors');
@@ -11,8 +11,8 @@ app.use(express.json());
 
 // Configuration
 const CONFIG = {
-  MIN_TRADE_SIZE: parseInt(process.env.MIN_TRADE_SIZE) || 15000, // $15k minimum
-  VOLUME_SPIKE_THRESHOLD: parseInt(process.env.VOLUME_SPIKE_THRESHOLD) || 50000, // $50k volume spike
+  MIN_TRADE_SIZE: parseInt(process.env.MIN_TRADE_SIZE) || 15000,
+  VOLUME_SPIKE_THRESHOLD: parseInt(process.env.VOLUME_SPIKE_THRESHOLD) || 50000,
   DISCORD_WEBHOOK: process.env.DISCORD_WEBHOOK || '',
   POLL_INTERVAL: 30000, // 30 seconds
   KALSHI_API: 'https://api.elections.kalshi.com/trade-api/v2'
@@ -20,7 +20,7 @@ const CONFIG = {
 
 // In-memory storage
 const recentWhales = [];
-const marketCache = new Map(); // Store previous market states
+const marketCache = new Map();
 const seenAlerts = new Set();
 
 // Get active markets
@@ -36,7 +36,7 @@ async function getActiveMarkets() {
     
     return response.data.markets || [];
   } catch (error) {
-    console.error('Error fetching markets:', error.message);
+    console.error('❌ Error fetching markets:', error.message);
     return [];
   }
 }
@@ -50,41 +50,23 @@ async function getOrderbook(ticker) {
     
     return response.data.orderbook || null;
   } catch (error) {
-    console.error(`Error fetching orderbook for ${ticker}:`, error.message);
+    // Silently fail for individual markets
     return null;
   }
-}
-
-// Calculate total orderbook size
-function calculateOrderbookSize(orderbook) {
-  if (!orderbook) return { yesSize: 0, noSize: 0 };
-  
-  const yesSize = (orderbook.yes || []).reduce((sum, order) => {
-    // order format: [price_in_cents, quantity]
-    return sum + (order[0] * order[1] / 100); // Convert cents to dollars
-  }, 0);
-  
-  const noSize = (orderbook.no || []).reduce((sum, order) => {
-    return sum + (order[0] * order[1] / 100);
-  }, 0);
-  
-  return { yesSize, noSize };
 }
 
 // Send Discord alert
 async function sendDiscordAlert(whale) {
   if (!CONFIG.DISCORD_WEBHOOK) {
-    console.log('⚠️  Discord webhook not configured');
     return;
   }
   
   try {
     const outcomeEmoji = whale.outcome === 'YES' ? '📈' : '📉';
     const outcomeColor = whale.outcome === 'YES' ? 0x00FF00 : 0xFF0000;
-    const alertType = whale.type === 'large_order' ? '💰 LARGE ORDER' : '📊 VOLUME SPIKE';
     
     const embed = {
-      title: `🐋 KALSHI WHALE ALERT - ${alertType}`,
+      title: '🐋 KALSHI WHALE ALERT - LARGE ORDER',
       color: outcomeColor,
       fields: [
         { 
@@ -98,7 +80,7 @@ async function sendDiscordAlert(whale) {
           inline: true 
         },
         { 
-          name: '💰 Size', 
+          name: '💰 Order Size', 
           value: `**$${whale.amount.toLocaleString()}**`, 
           inline: true 
         },
@@ -118,33 +100,31 @@ async function sendDiscordAlert(whale) {
     };
 
     await axios.post(CONFIG.DISCORD_WEBHOOK, { 
-      content: `@everyone 🚨 **${alertType}** detected! $${whale.amount.toLocaleString()} on ${whale.outcome}!`,
+      content: `@everyone 🚨 **LARGE ORDER** detected! $${whale.amount.toLocaleString()} on ${whale.outcome}!`,
       embeds: [embed] 
     });
     
-    console.log(`✅ Discord alert sent: $${whale.amount.toFixed(0)} ${whale.outcome} on ${whale.ticker}`);
+    console.log(`✅ Alert sent: $${whale.amount.toFixed(0)} ${whale.outcome} on ${whale.ticker}`);
   } catch (error) {
-    console.error('❌ Discord alert failed:', error.message);
+    console.error('❌ Discord failed:', error.message);
   }
 }
 
 // Detect large orders in orderbook
 function detectLargeOrders(market, orderbook) {
   const whales = [];
-  const { yesSize, noSize } = calculateOrderbookSize(orderbook);
   
-  // Check YES side for large orders
-  if (orderbook.yes) {
+  // Check YES side
+  if (orderbook.yes && Array.isArray(orderbook.yes)) {
     for (const order of orderbook.yes) {
       const [price, quantity] = order;
-      const orderValue = (price * quantity) / 100; // Convert to dollars
+      const orderValue = (price * quantity) / 100; // Convert cents to dollars
       
       if (orderValue >= CONFIG.MIN_TRADE_SIZE) {
-        const alertId = `${market.ticker}-YES-${price}-${quantity}`;
+        const alertId = `${market.ticker}-YES-${price}-${quantity}-${Date.now()}`;
         if (!seenAlerts.has(alertId)) {
           seenAlerts.add(alertId);
           whales.push({
-            type: 'large_order',
             ticker: market.ticker,
             marketTitle: market.title,
             outcome: 'YES',
@@ -157,18 +137,17 @@ function detectLargeOrders(market, orderbook) {
     }
   }
   
-  // Check NO side for large orders
-  if (orderbook.no) {
+  // Check NO side
+  if (orderbook.no && Array.isArray(orderbook.no)) {
     for (const order of orderbook.no) {
       const [price, quantity] = order;
       const orderValue = (price * quantity) / 100;
       
       if (orderValue >= CONFIG.MIN_TRADE_SIZE) {
-        const alertId = `${market.ticker}-NO-${price}-${quantity}`;
+        const alertId = `${market.ticker}-NO-${price}-${quantity}-${Date.now()}`;
         if (!seenAlerts.has(alertId)) {
           seenAlerts.add(alertId);
           whales.push({
-            type: 'large_order',
             ticker: market.ticker,
             marketTitle: market.title,
             outcome: 'NO',
@@ -184,53 +163,6 @@ function detectLargeOrders(market, orderbook) {
   return whales;
 }
 
-// Detect volume spikes
-function detectVolumeSpike(market) {
-  const currentVolume = market.volume || 0;
-  const previousState = marketCache.get(market.ticker);
-  
-  if (!previousState) {
-    // First time seeing this market, just cache it
-    marketCache.set(market.ticker, {
-      volume: currentVolume,
-      timestamp: Date.now()
-    });
-    return null;
-  }
-  
-  const volumeIncrease = currentVolume - previousState.volume;
-  const timeDiff = (Date.now() - previousState.timestamp) / 1000; // seconds
-  
-  // Update cache
-  marketCache.set(market.ticker, {
-    volume: currentVolume,
-    timestamp: Date.now()
-  });
-  
-  // Alert if volume increased by threshold amount
-  if (volumeIncrease >= CONFIG.VOLUME_SPIKE_THRESHOLD) {
-    const alertId = `${market.ticker}-volume-${currentVolume}`;
-    if (!seenAlerts.has(alertId)) {
-      seenAlerts.add(alertId);
-      
-      // Determine likely side based on price movement
-      const outcome = market.yes_price > 50 ? 'YES' : 'NO';
-      
-      return {
-        type: 'volume_spike',
-        ticker: market.ticker,
-        marketTitle: market.title,
-        outcome: outcome,
-        amount: volumeIncrease,
-        price: market.yes_price || 0,
-        timestamp: new Date()
-      };
-    }
-  }
-  
-  return null;
-}
-
 // Main monitoring loop
 async function monitorKalshi() {
   console.log('🔍 Checking Kalshi markets...');
@@ -243,69 +175,49 @@ async function monitorKalshi() {
       return;
     }
     
-    console.log(`📊 Monitoring ${markets.length} active markets`);
-    
-    // Debug: Show volume of top 5 markets
-    const topMarkets = markets.slice(0, 5);
-    console.log('Top 5 markets by listing:');
-    topMarkets.forEach(m => {
-      console.log(`  - ${m.ticker}: volume=${m.volume || 0}`);
-    });
+    console.log(`📊 Found ${markets.length} active markets`);
     
     let checkedCount = 0;
     let whalesFound = 0;
     
-    // Check high-volume markets first
-    const sortedMarkets = markets
-      .filter(m => m.volume > 1000) // Only check markets with >$1k volume
-      .sort((a, b) => b.volume - a.volume)
-      .slice(0, 50); // Check top 50 by volume
-    
-    for (const market of sortedMarkets) {
+    // Check first 30 markets
+    for (const market of markets.slice(0, 30)) {
       try {
-        // Check for volume spikes
-        const volumeWhale = detectVolumeSpike(market);
-        if (volumeWhale) {
-          recentWhales.unshift(volumeWhale);
-          await sendDiscordAlert(volumeWhale);
-          whalesFound++;
-        }
-        
-        // Check orderbook for large orders
         const orderbook = await getOrderbook(market.ticker);
+        
         if (orderbook) {
           const orderWhales = detectLargeOrders(market, orderbook);
+          
           for (const whale of orderWhales) {
             recentWhales.unshift(whale);
             await sendDiscordAlert(whale);
             whalesFound++;
           }
+          
+          checkedCount++;
         }
         
-        checkedCount++;
-        
         // Rate limiting
-        await new Promise(resolve => setTimeout(resolve, 500));
+        await new Promise(resolve => setTimeout(resolve, 200));
       } catch (err) {
-        console.error(`Error processing ${market.ticker}:`, err.message);
+        // Skip problematic markets
       }
     }
     
-    // Cleanup old alerts (keep last 1000)
-    if (seenAlerts.size > 1000) {
-      const alerts = Array.from(seenAlerts);
+    // Cleanup
+    if (seenAlerts.size > 500) {
+      const alerts = Array.from(seenAlerts).slice(-250);
       seenAlerts.clear();
-      alerts.slice(-500).forEach(id => seenAlerts.add(id));
+      alerts.forEach(id => seenAlerts.add(id));
     }
     
-    // Keep only last 100 whales
     if (recentWhales.length > 100) {
       recentWhales.splice(100);
     }
     
     console.log(`✅ Checked ${checkedCount} markets. Found ${whalesFound} whales.`);
   } catch (error) {
-    console.error('❌ Monitoring error:', error.message);
+    console.error('❌ Error:', error.message);
   }
 }
 
@@ -313,24 +225,18 @@ async function monitorKalshi() {
 app.get('/api/whales', (req, res) => {
   res.json({
     whales: recentWhales,
-    count: recentWhales.length,
-    config: {
-      minTradeSize: CONFIG.MIN_TRADE_SIZE,
-      volumeSpikeThreshold: CONFIG.VOLUME_SPIKE_THRESHOLD
-    }
+    count: recentWhales.length
   });
 });
 
 app.get('/api/stats', (req, res) => {
   const totalVolume = recentWhales.reduce((sum, w) => sum + w.amount, 0);
-  const avgWhaleSize = recentWhales.length > 0 ? totalVolume / recentWhales.length : 0;
   
   res.json({
     totalWhales: recentWhales.length,
     totalVolume: totalVolume,
-    avgWhaleSize: avgWhaleSize,
-    lastUpdate: recentWhales[0]?.timestamp || null,
-    trackedMarkets: marketCache.size
+    avgWhaleSize: recentWhales.length > 0 ? totalVolume / recentWhales.length : 0,
+    lastUpdate: recentWhales[0]?.timestamp || null
   });
 });
 
@@ -338,9 +244,7 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     uptime: process.uptime(),
-    whalesDetected: recentWhales.length,
-    trackedMarkets: marketCache.size,
-    mode: 'kalshi-monitoring'
+    whalesDetected: recentWhales.length
   });
 });
 
@@ -348,18 +252,15 @@ app.get('/health', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Kalshi Whale Tracker LIVE`);
-  console.log(`💰 Min order size: $${CONFIG.MIN_TRADE_SIZE.toLocaleString()}`);
-  console.log(`📊 Volume spike threshold: $${CONFIG.VOLUME_SPIKE_THRESHOLD.toLocaleString()}`);
-  console.log(`🔔 Discord alerts: ${CONFIG.DISCORD_WEBHOOK ? '✅ Enabled' : '❌ Disabled'}`);
-  console.log(`🎯 Monitoring Kalshi via public API...`);
+  console.log(`💰 Min order: $${CONFIG.MIN_TRADE_SIZE.toLocaleString()}`);
+  console.log(`🔔 Discord: ${CONFIG.DISCORD_WEBHOOK ? 'Enabled' : 'Disabled'}`);
   console.log('');
   
-  // Start monitoring
   monitorKalshi();
   setInterval(monitorKalshi, CONFIG.POLL_INTERVAL);
 });
 
 process.on('SIGTERM', () => {
-  console.log('👋 Shutting down');
+  console.log('Shutting down');
   process.exit(0);
 });
